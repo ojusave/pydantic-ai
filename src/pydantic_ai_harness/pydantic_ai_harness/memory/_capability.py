@@ -120,7 +120,7 @@ class Memory(AbstractCapability[AgentDepsT]):
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> Memory[AgentDepsT]:
         """Return a clone with scope resolution isolated to this run."""
-        # Durable registration and each run must see the same static toolset.
+        # Keep the toolset registered at construction when the run replaces this capability.
         self.get_toolset()
         clone = copy(self)
         clone._resolved_scope = None
@@ -143,16 +143,7 @@ class Memory(AbstractCapability[AgentDepsT]):
 
         A `FileStore` without a workspace of its own is bound to `ctx.workspace`.
         """
-        resolved = self._resolved_scope
-
-        def select_scope(capability: AbstractCapability[AgentDepsT]) -> None:
-            nonlocal resolved
-            if isinstance(capability, Memory) and capability.get_toolset() is self.get_toolset():
-                resolved = capability._resolved_scope
-
-        if resolved is None and ctx.root_capability is not None:
-            ctx.root_capability.apply(select_scope)
-        store, scope = resolved if resolved is not None else self._resolve_scope(ctx)
+        store, scope = self._resolved_scope if self._resolved_scope is not None else self._resolve_scope(ctx)
         return (store.bind(ctx.workspace) if isinstance(store, FileStore) else store), scope
 
     def _resolve_scope(self, ctx: RunContext[AgentDepsT]) -> tuple[MemoryStore, str]:

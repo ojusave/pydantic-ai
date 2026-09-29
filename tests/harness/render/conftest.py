@@ -27,14 +27,14 @@ except ModuleNotFoundError as exc:
     _render_spec = None
 
 if TYPE_CHECKING:
-    from render.workflows import TaskContext, TaskDefinition, TaskRunMetadata
+    from render.workflows import TaskContext, TaskDefinition
 elif _render_spec is None:
     collect_ignore_glob = ['*.py']
 
     class TaskContext:
         """Placeholder used only while pytest ignores Render-extra tests."""
 else:
-    from render.workflows import TaskContext, TaskDefinition, TaskRunMetadata
+    from render.workflows import TaskContext, TaskDefinition
 
 
 def pytest_ignore_collect(collection_path: Path) -> bool:
@@ -69,10 +69,6 @@ class RecordingTaskContext(TaskContext):
 
     def __init__(self) -> None:
         self.task_names: list[str] = []
-
-    @property
-    def metadata(self) -> TaskRunMetadata:
-        return TaskRunMetadata(task_run_id='child', parent_task_run_id='parent', root_task_run_id='root')
 
     async def run(self, task: TaskDefinition[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
         self.task_names.append(task.name)
