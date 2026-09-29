@@ -146,6 +146,7 @@ _CAPABILITY_PAGE_META = {
     'sprites-sandbox.md': ('sprites_sandbox', 'Sprites Sandbox'),
     'repo-context.md': ('repo_context', 'Repo Context'),
     'repair-tool-arguments.md': ('repair_tool_arguments', 'Repair Tool Arguments'),
+    'render-workflows.md': ('render', 'Render Workflows'),
     'researcher.md': ('researcher', 'Researcher'),
     'pydantic-ai-docs.md': ('pydantic_ai_docs', 'Pydantic AI Docs'),
     'exa-search.md': ('exa', 'Exa Search'),
