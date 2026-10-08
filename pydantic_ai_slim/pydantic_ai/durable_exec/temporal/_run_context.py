@@ -2,16 +2,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, overload
 
-from pydantic import TypeAdapter
 from typing_extensions import TypeVar
 
-from pydantic_ai._run_context import AnchoredEvidence, CapabilityEventT, CustomEventT
+from pydantic_ai._run_context import CapabilityEventT, CustomEventT
 from pydantic_ai.capabilities.abstract import select_workspace
+from pydantic_ai.durable_exec import SerializedRunContext
 from pydantic_ai.durable_exec._toolset import EnqueueGuard, enqueue_not_supported_message
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import CapabilityEvent, CustomEvent
 from pydantic_ai.tools import RunContext
-from pydantic_ai.usage import RunUsage, UsageLimits
 from pydantic_ai.workspaces import Workspace, WorkspaceRef
 from pydantic_ai.workspaces.unavailable import NO_WORKSPACE, UnavailableWorkspace
 
@@ -22,56 +21,6 @@ AgentDepsT = TypeVar('AgentDepsT', default=object, covariant=True)
 """Type variable for the agent dependencies in `RunContext`."""
 
 
-# The serialized run context crosses the activity boundary as untyped JSON (`Any`, so
-# `TemporalRunContext` subclasses can add their own fields), which means a value whose type isn't
-# JSON-native arrives back in a different shape than it went in: a model or content object as a
-# plain dict, a set as a list. Every carried field with such a type is listed here with the shape
-# it arrives in and the adapter that turns it back into the real thing, so activity-side code gets
-# the objects it would get in a non-durable run: `usage`/`usage_limits` drive the mid-chain
-# continuation usage check, while the history-derived sets and dispatch-only supplements feed tool
-# availability. Activity-side mutations are discarded; reveal deltas are applied to workflow state
-# after the activity result returns.
-_str_set_ta: TypeAdapter[set[str]] = TypeAdapter(set[str])
-_REHYDRATORS: tuple[tuple[str, type[Any], TypeAdapter[Any]], ...] = (
-    ('usage', dict, TypeAdapter(RunUsage)),
-    ('usage_limits', dict, TypeAdapter(UsageLimits)),
-    ('loaded_capability_ids', list, _str_set_ta),
-    ('discovered_tool_names', list, _str_set_ta),
-    ('available_tool_names', list, _str_set_ta),
-    ('active_capability_ids', list, _str_set_ta),
-    ('_deferred_capability_ids', list, _str_set_ta),
-    ('_anchored_evidence', dict, TypeAdapter(AnchoredEvidence)),
-    # Not a `RunContext` field: the ref rides alongside so the activity can rebuild `workspace`.
-    ('workspace_ref', dict, TypeAdapter(WorkspaceRef)),
-)
-
-# Fields that `serialize_run_context` doesn't carry but that are still readable inside an activity,
-# as `None` unless the framework attaches something: `agent` and `root_capability` are re-attached
-# from the worker's agent instance, `pending_messages` is replaced by an `EnqueueGuard` so
-# `ctx.enqueue()` raises an explanation, and `tool_manager` is documented to be `None` inside
-# activities — `available_tool_names` then reads the snapshot serialized at dispatch time (see
-# the property override below), or falls back to `discovered_tool_names` without one.
-# `realtime_session` is a live session object that cannot cross the boundary, and its contract
-# already makes `None` mean "not available here". `_run_held_toolsets` is the same: an activity may
-# run in another process, so it enters its own toolset instead of reusing the one the run holds.
-_NONE_UNLESS_ATTACHED = (
-    'agent',
-    'root_capability',
-    'pending_messages',
-    'tool_manager',
-    'realtime_session',
-    '_durable_operations',
-    '_run_capabilities_by_id',
-    '_run_held_toolsets',
-)
-
-# Defaulted rather than guarded when a payload doesn't carry it. Unlike the guarded fields, the
-# dataclass default can't be mistaken for real run state here: empty means "no anchored evidence",
-# which is exactly what `is_tool_available` reads when the serving response has no provenance. A
-# custom `serialize_run_context` written before this field existed therefore keeps answering — with
-# the history-derived window — instead of raising for a field it never knew to carry.
-_DEFAULTED_UNLESS_CARRIED: tuple[tuple[str, Any], ...] = (('_anchored_evidence', AnchoredEvidence()),)
-
 # Payloads written by a worker running an older version, or by a custom `serialize_run_context` that
 # still spells the old name. An activity can be dispatched by one worker version and replayed by
 # another, so the old key has to keep arriving at the renamed field — otherwise the field lands in
@@ -81,13 +30,8 @@ _RENAMED_FIELDS: tuple[tuple[str, str], ...] = (
     ('available_capability_ids', 'active_capability_ids'),
 )
 
-# Reading any other omitted field raises instead of returning the `RunContext` dataclass default,
-# which would silently pass for real run state (e.g. `instrumentation_version` reading as the
-# default version rather than the run's, or `prompt` as `None` for a subclass that drops it).
-_GUARDED_FIELDS = frozenset(RunContext.__dataclass_fields__) - {'deps', *_NONE_UNLESS_ATTACHED}
 
-
-class TemporalRunContext(RunContext[AgentDepsT]):
+class TemporalRunContext(SerializedRunContext[AgentDepsT]):
     """The [`RunContext`][pydantic_ai.tools.RunContext] subclass to use to serialize and deserialize the run context for use inside a Temporal activity.
 
     By default, only the `deps`, `run_id`, `conversation_id`, `metadata`, `retries`, `tool_call_id`, `tool_name`, `tool_call_approved`, `tool_call_metadata`, `retry`, `max_retries`, `run_step`, `usage`, `usage_limits`, `partial_output`, `trace_include_content`, `instrumentation_version`, `loaded_capability_ids`, `discovered_tool_names`, the private dispatch-only availability supplements, and `capability_active` attributes will be available. Reading any other attribute raises a `UserError` explaining how to make it available, rather than returning its default value, so a field that didn't cross the boundary can't be mistaken for real run state.
@@ -97,84 +41,26 @@ class TemporalRunContext(RunContext[AgentDepsT]):
     """
 
     def __init__(self, deps: AgentDepsT, **kwargs: Any):
-        kwargs.setdefault('workspace', Workspace(NO_WORKSPACE))
-        self.__dict__ = {**kwargs, 'deps': deps}
         for old_name, new_name in _RENAMED_FIELDS:
             # Keyed on presence, not truthiness: `capability_active` is `None` for every activity
             # dispatched outside capability dispatch — the common case — and a value-based guard
             # would drop the key there, leaving the renamed field absent and the guard below
             # reporting it as one that never crossed the boundary.
-            if old_name in self.__dict__:
-                self.__dict__.setdefault(new_name, self.__dict__.pop(old_name))
-        for name in _NONE_UNLESS_ATTACHED:
-            self.__dict__.setdefault(name, None)
-        for name, default in _DEFAULTED_UNLESS_CARRIED:
-            self.__dict__.setdefault(name, default)
-        for name, wire_type, adapter in _REHYDRATORS:
-            if isinstance(value := self.__dict__.get(name), wire_type):
-                self.__dict__[name] = adapter.validate_python(value)
-        setattr(
-            self,
-            '__dataclass_fields__',
-            {name: field for name, field in RunContext.__dataclass_fields__.items() if name in self.__dict__},
-        )
+            if old_name in kwargs:
+                kwargs.setdefault(new_name, kwargs.pop(old_name))
+        super().__init__(deps, **kwargs)
 
-    def __getattribute__(self, name: str) -> Any:
-        if name in _GUARDED_FIELDS and name not in object.__getattribute__(self, '__dataclass_fields__'):
-            raise UserError(
-                f'{name!r} is not available on {self.__class__.__name__!r} inside a Temporal activity. '
-                'To make the attribute available, create a `TemporalRunContext` subclass with a custom `serialize_run_context` class method that returns a dictionary that includes the attribute and pass it as the `run_context_type` argument to `TemporalDurability`.'
-            )
-        return super().__getattribute__(name)
+    @classmethod
+    def _missing_field_message(cls, name: str) -> str:
+        return (
+            f'{name!r} is not available on {cls.__name__!r} inside a Temporal activity. '
+            'To make the attribute available, create a `TemporalRunContext` subclass with a custom `serialize_run_context` class method that returns a dictionary that includes the attribute and pass it as the `run_context_type` argument to `TemporalDurability`.'
+        )
 
     def _expose_field(self, name: str) -> None:
         """Mark a framework-attached field as readable after deserialization."""
         instance_fields = object.__getattribute__(self, '__dataclass_fields__')
         instance_fields[name] = RunContext.__dataclass_fields__[name]
-
-    @property
-    def available_tool_names(self) -> set[str]:
-        """The availability snapshot serialized at activity dispatch time.
-
-        Live tool state doesn't cross the activity boundary, but availability was already
-        resolved when the activity was dispatched — so the name form of
-        [`is_tool_available`][pydantic_ai.tools.RunContext.is_tool_available] answers correctly
-        for always-visible tools too, instead of degrading to the `discovered_tool_names`
-        fallback. Custom subclasses whose `serialize_run_context` doesn't carry the snapshot
-        keep the base fallback behavior.
-        """
-        if (snapshot := self.__dict__.get('available_tool_names')) is not None:
-            return snapshot
-        return super().available_tool_names
-
-    @property
-    def active_capability_ids(self) -> set[str]:
-        """The set of active capability ids serialized at activity dispatch time.
-
-        The `capabilities` registry itself can't cross the boundary, but the ids it resolves to
-        can, so [`is_tool_available`][pydantic_ai.tools.RunContext.is_tool_available] still
-        answers for a capability-owned tool instead of raising. Custom subclasses whose
-        `serialize_run_context` doesn't carry the snapshot fall back to the base property, which
-        reads the registry and raises inside an activity.
-        """
-        if (snapshot := self.__dict__.get('active_capability_ids')) is not None:
-            return snapshot
-        return super().active_capability_ids
-
-    @property
-    def _deferred_capability_ids(self) -> set[str]:
-        """The set of on-demand capability ids serialized at activity dispatch time.
-
-        `is_tool_available` needs the *configured* shape of a capability, not just what history says
-        was loaded, and reads it from the registry — which cannot cross the boundary. Carrying the
-        ids keeps a loaded capability's own tools answering as available inside an activity instead
-        of falling back to a reveal marker that, for these tools, nothing can regenerate. Custom
-        subclasses whose `serialize_run_context` omits the snapshot fall back to the base property,
-        which reads the registry and raises inside an activity.
-        """
-        if (snapshot := self.__dict__.get('_deferred_capability_ids')) is not None:
-            return snapshot
-        return super()._deferred_capability_ids
 
     @overload
     async def emit(self, event: CustomEventT, /) -> CustomEventT: ...
@@ -205,43 +91,7 @@ class TemporalRunContext(RunContext[AgentDepsT]):
     @classmethod
     def serialize_run_context(cls, ctx: RunContext[Any]) -> dict[str, Any]:
         """Serialize the run context to a `dict[str, Any]`."""
-        serialized: dict[str, Any] = {
-            'run_id': ctx.run_id,
-            'conversation_id': ctx.conversation_id,
-            'metadata': ctx.metadata,
-            'retries': ctx.retries,
-            'tool_call_id': ctx.tool_call_id,
-            'tool_name': ctx.tool_name,
-            'tool_call_approved': ctx.tool_call_approved,
-            'tool_call_metadata': ctx.tool_call_metadata,
-            'retry': ctx.retry,
-            'max_retries': ctx.max_retries,
-            'run_step': ctx.run_step,
-            'partial_output': ctx.partial_output,
-            'trace_include_content': ctx.trace_include_content,
-            'instrumentation_version': ctx.instrumentation_version,
-            'usage': ctx.usage,
-            'usage_limits': ctx.usage_limits,
-            'loaded_capability_ids': ctx.loaded_capability_ids,
-            'discovered_tool_names': ctx.discovered_tool_names,
-            # The dispatch-time widening of the two sets above, which `is_tool_available` reads for
-            # a call the model has already made. Carried so a tool asking whether it may run gets
-            # the same answer inside an activity as it would in-process.
-            '_anchored_evidence': ctx._anchored_evidence,
-            # A resolved snapshot: at dispatch time live tool state exists, so this carries the
-            # always-visible tools that the in-activity `discovered_tool_names` fallback misses.
-            'available_tool_names': ctx.available_tool_names,
-            # Likewise a snapshot rather than the registry: these ids are plain strings, while the
-            # capability objects they key are not serializable. `is_tool_available` consults this
-            # for any capability-owned tool, so without it the definition form — the form the docs
-            # send toolset authors to — raises inside an activity instead of answering.
-            'active_capability_ids': ctx.active_capability_ids,
-            # The configured on-demand set, which `is_tool_available` consults to tell a loaded
-            # deferred capability (whose load is itself the reveal for its tools) from one that has
-            # since been reconfigured always-on. Derived from the registry, so it must travel too.
-            '_deferred_capability_ids': ctx._deferred_capability_ids,
-            'capability_active': ctx.capability_active,
-        }
+        serialized = super().serialize_run_context(ctx)
         # Only the reference crosses into the activity; the live handle stays in the workflow, and
         # `TemporalRunContext.__init__` supplies the inert default when no reference was serialized.
         if (workspace_ref := ctx.workspace.ref) is not None:
