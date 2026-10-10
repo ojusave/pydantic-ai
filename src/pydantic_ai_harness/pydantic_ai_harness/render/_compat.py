@@ -33,10 +33,9 @@ from pydantic import TypeAdapter
 from typing_extensions import TypeVar as TypeVarExtensions
 
 from pydantic_ai import Agent
-from pydantic_ai._run_context import AnchoredEvidence
 from pydantic_ai.agent.abstract import AbstractAgent
 from pydantic_ai.capabilities.abstract import select_workspace
-from pydantic_ai.durable_exec import JSON_CODEC
+from pydantic_ai.durable_exec import JSON_CODEC, SerializedRunContext
 from pydantic_ai.durable_exec._capability_operation import (
     CapabilityMethodDeclaration,
     CapabilityOperationParams,
@@ -71,7 +70,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, ToolsetTool
 from pydantic_ai.toolsets.function import FunctionToolsetTool
-from pydantic_ai.usage import RunUsage, UsageLimits
+from pydantic_ai.usage import RunUsage
 from pydantic_ai.workspaces import Workspace, WorkspaceRef
 from pydantic_ai.workspaces.unavailable import NO_WORKSPACE, UnavailableWorkspace
 
@@ -391,63 +390,22 @@ def make_model_request_context(
     return context
 
 
-_STR_SET_ADAPTER: TypeAdapter[set[str]] = TypeAdapter(set[str])
-_REHYDRATORS: tuple[tuple[str, type[Any], TypeAdapter[Any]], ...] = (
-    ('usage', dict, TypeAdapter(RunUsage)),
-    ('usage_limits', dict, TypeAdapter(UsageLimits)),
-    ('loaded_capability_ids', list, _STR_SET_ADAPTER),
-    ('discovered_tool_names', list, _STR_SET_ADAPTER),
-    ('available_tool_names', list, _STR_SET_ADAPTER),
-    ('active_capability_ids', list, _STR_SET_ADAPTER),
-    ('_deferred_capability_ids', list, _STR_SET_ADAPTER),
-    ('_anchored_evidence', dict, TypeAdapter(AnchoredEvidence)),
-    ('workspace_ref', dict, TypeAdapter(WorkspaceRef)),
-)
-
-_NONE_UNLESS_ATTACHED = (
-    'agent',
-    'root_capability',
-    'pending_messages',
-    'validation_context',
-    'tool_manager',
-    'realtime_session',
-    '_durable_operations',
-    '_run_capabilities_by_id',
-    '_run_held_toolsets',
-)
-_DEFAULTED_UNLESS_CARRIED: tuple[tuple[str, Any], ...] = (('_anchored_evidence', AnchoredEvidence()),)
-_GUARDED_FIELDS = frozenset(RunContext.__dataclass_fields__) - {'deps', *_NONE_UNLESS_ATTACHED}
-
-
-class RenderRunContext(RunContext[AgentDepsT]):
+class RenderRunContext(SerializedRunContext[AgentDepsT]):
     """Restricted run context reconstructed inside a Render child task."""
 
     def __init__(self, deps: AgentDepsT, **kwargs: Any):
-        self.__dict__ = {**kwargs, 'deps': deps}
-        self.__dict__.setdefault('tracer', NoOpTracer())
-        self.__dict__.setdefault('workspace', Workspace(NO_WORKSPACE))
-        for name in _NONE_UNLESS_ATTACHED:
-            self.__dict__.setdefault(name, None)
-        for name, default in _DEFAULTED_UNLESS_CARRIED:
-            self.__dict__.setdefault(name, default)
-        for name, wire_type, adapter in _REHYDRATORS:
-            if isinstance(value := self.__dict__.get(name), wire_type):
-                self.__dict__[name] = adapter.validate_python(value)
+        kwargs.setdefault('tracer', NoOpTracer())
+        kwargs.setdefault('validation_context', None)
+        super().__init__(deps, **kwargs)
         from ._protocol import current_effect_recorder
 
         usage = self.__dict__.get('usage')
         if isinstance(usage, RunUsage) and (recorder := current_effect_recorder()):
             recorder.watch_usage(usage)
-        setattr(
-            self,
-            '__dataclass_fields__',
-            {name: field for name, field in RunContext.__dataclass_fields__.items() if name in self.__dict__},
-        )
 
-    def __getattribute__(self, name: str) -> Any:
-        if name in _GUARDED_FIELDS and name not in object.__getattribute__(self, '__dataclass_fields__'):
-            raise UserError(f'{name!r} is not available on {self.__class__.__name__!r} inside a Render child task.')
-        return super().__getattribute__(name)
+    @classmethod
+    def _missing_field_message(cls, name: str) -> str:
+        return f'{name!r} is not available on {cls.__name__!r} inside a Render child task.'
 
     def restore_snapshots(self, source: RenderRunContext[AgentDepsT]) -> None:
         """Preserve worker-only state after core guards copy the dataclass fields.
@@ -464,24 +422,6 @@ class RenderRunContext(RunContext[AgentDepsT]):
         ):
             if name in source.__dict__:
                 self.__dict__[name] = source.__dict__[name]
-
-    @property
-    def available_tool_names(self) -> set[str]:
-        if (snapshot := self.__dict__.get('available_tool_names')) is not None:
-            return snapshot
-        return super().available_tool_names
-
-    @property
-    def active_capability_ids(self) -> set[str]:
-        if (snapshot := self.__dict__.get('active_capability_ids')) is not None:
-            return snapshot
-        return super().active_capability_ids
-
-    @property
-    def _deferred_capability_ids(self) -> set[str]:
-        if (snapshot := self.__dict__.get('_deferred_capability_ids')) is not None:
-            return snapshot
-        return super()._deferred_capability_ids
 
     @overload
     async def emit(self, event: CustomEventT, /) -> CustomEventT: ...
@@ -521,36 +461,17 @@ class RenderRunContext(RunContext[AgentDepsT]):
     @classmethod
     def serialize_run_context(cls, ctx: RunContext[Any]) -> dict[str, Any]:
         """Project the serializable context state needed by child operations."""
-        return {
-            'run_id': ctx.run_id,
-            'conversation_id': ctx.conversation_id,
-            # Models contain provider clients and cannot be serialized. Their
-            # stable IDs can cross the boundary and resolve worker-side.
-            '_model_id': ctx.model_id,
-            'metadata': ctx.metadata,
-            'retries': ctx.retries,
-            'tool_call_id': ctx.tool_call_id,
-            'tool_name': ctx.tool_name,
-            'tool_call_approved': ctx.tool_call_approved,
-            'tool_call_metadata': ctx.tool_call_metadata,
-            'retry': ctx.retry,
-            'max_retries': ctx.max_retries,
-            'run_step': ctx.run_step,
-            'partial_output': ctx.partial_output,
-            'trace_include_content': ctx.trace_include_content,
-            'tracer_enabled': not isinstance(ctx.tracer, NoOpTracer),
-            'instrumentation_version': ctx.instrumentation_version,
-            'usage': ctx.usage,
-            'usage_limits': ctx.usage_limits,
-            'loaded_capability_ids': ctx.loaded_capability_ids,
-            'discovered_tool_names': ctx.discovered_tool_names,
-            '_anchored_evidence': ctx._anchored_evidence,
-            'available_tool_names': ctx.available_tool_names,
-            'active_capability_ids': ctx.active_capability_ids,
-            '_deferred_capability_ids': ctx._deferred_capability_ids,
-            'capability_active': ctx.capability_active,
-            'workspace_ref': ctx.workspace.ref,
-        }
+        projected = super().serialize_run_context(ctx)
+        projected.update(
+            {
+                # Models contain provider clients and cannot be serialized. Their
+                # stable IDs can cross the boundary and resolve worker-side.
+                '_model_id': ctx.model_id,
+                'tracer_enabled': not isinstance(ctx.tracer, NoOpTracer),
+                'workspace_ref': ctx.workspace.ref,
+            }
+        )
+        return projected
 
     @classmethod
     def deserialize_run_context(
